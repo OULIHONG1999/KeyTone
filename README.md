@@ -1,4 +1,4 @@
-# KeyTone 键响匣（幽灵版）
+# KeyTone 键响匣（幽灵版）· v0.8
 
 > 详细设计文档见 [DOCS.md](DOCS.md)（架构设计、关键机制、排障指南）。
 
@@ -6,11 +6,15 @@
 
 内置三种模式，按 `F12` 循环切换：**按键音效**（默认）→ **音符弹琴**（任意按键发电子琴音）→ **预制旋律**（不管按哪个键，都按内置乐谱推进播放，像音乐盒）。
 
+**打断式播放**：每次按键音都立即打断正在播放的前一个音（不叠加、不糊音）。
+
 ## 启动
 
 1. 依赖安装（首次）：`pip install pynput pygame`
 2. 确认 `sounds/` 下存在对应 wav（可用 `generate_sounds.py` 生成测试音）
-3. 双击 `start_ghost.vbs`（无窗口启动），或命令行运行 `pythonw main.py`
+3. 启动方式任选：
+   - **打包版**：双击 `dist/KeyTone.exe`（推荐，无需 Python 环境）
+   - 源码版：双击 `start_ghost.vbs`（无窗口），或命令行 `pythonw main.py`
 
 启动成功会弹自定义轻量 toast「已启动，后台静默运行中」（tkinter 进程内绘制，右下角自动消失，几十毫秒响应，无系统弹窗）；若已有实例在运行，弹 toast「已在运行，请勿重复启动」后自动退出。
 > 无需管理员权限：pynput 低级键盘钩子普通权限即可全局监听，唯一限制是监听不到"以管理员身份运行"的窗口内的按键（UAC 隔离）。
@@ -50,13 +54,17 @@
 
 | 文件 | 作用 |
 |---|---|
-| `main.py` | 幽灵版主程序（无窗口/无退出/静默调节/文件日志） |
-| `start_ghost.vbs` | 双击无窗口启动脚本 |
+| `main.py` | 主程序（三种模式/打断播放/单实例/toast/文件日志） |
+| `start_ghost.vbs` | 双击无窗口启动脚本（源码版） |
 | `generate_sounds.py` | 测试音效生成器（可调音色后重跑） |
-| `sounds/` | wav 音效目录 |
+| `download_douyin.py` | 抖音视频下载工具（Cookie 放 `douyin_cookies.txt`，不入库） |
+| `KeyTone.spec` | PyInstaller 打包配置 |
+| `sounds/` | wav 音效目录（enter.wav 为「牛来叫妈妈」前 5 秒） |
+| `dist/KeyTone.exe` | 打包产物（17.7MB，双击即用，不入库） |
+| `DOCS.md` | 详细设计文档 |
 
 ## 后续规划
 
 - 增加简单 tkinter 图形界面
 - 实现 json 配置文件保存按键-音色映射
-- 打包 exe 可执行文件（幽灵模式可隐藏窗口）
+- ~~打包 exe 可执行文件~~ ✅ 已完成（`dist/KeyTone.exe`）

@@ -66,12 +66,16 @@ pythonw main.py
 
 | 文件 | 作用 | 可否删除 |
 |---|---|---|
-| `main.py` | 幽灵版主程序（全部核心逻辑） | 否 |
-| `start_ghost.vbs` | 双击无窗口启动脚本 | 否 |
+| `main.py` | 主程序（三种模式/打断播放/单实例/toast/日志） | 否 |
+| `start_ghost.vbs` | 双击无窗口启动脚本（源码版） | 否 |
 | `generate_sounds.py` | 测试音效生成器（纯标准库） | 可选 |
+| `download_douyin.py` | 抖音视频下载工具（Cookie 从 `douyin_cookies.txt` 读取） | 可选 |
+| `douyin_cookies.txt` | 抖音登录 Cookie（敏感，**不入库**） | 用完可删 |
+| `KeyTone.spec` | PyInstaller 打包配置 | 否 |
+| `dist/KeyTone.exe` | 打包产物（双击即用，**不入库**） | 可随时重新打包 |
 | `README.md` | 简明使用说明 | 可选 |
 | `DOCS.md` | 本文档（详细设计） | 可选 |
-| `sounds/*.wav` | 按键音效（a/b/space/enter/esc/default） | 否（缺了就没声音） |
+| `sounds/*.wav` | 按键音效（enter.wav 为「牛来叫妈妈」前 5 秒） | 否（缺了就没声音） |
 | `keytone.log` | 运行日志（自动生成） | 可随时删除 |
 
 ---
@@ -244,6 +248,20 @@ pygame.mixer.init(frequency=44100, size=-16, channels=1)
 - 显式指定**单声道 16bit**：`get_raw()` 返回的原始采样格式确定，变调重采样按 1 采样 = 2 字节处理
 - 若用 pygame 默认（双声道），重采样逻辑需按帧处理，会复杂得多
 
+### 5.6 打断式播放
+
+```python
+pygame.mixer.set_num_channels(1)   # 单通道限制
+
+def _play_interrupt(snd):
+    pygame.mixer.stop()            # 先停掉所有正在播的音
+    snd.play()                     # 再播新音
+```
+
+- **问题背景**：pygame 的 `Sound.play()` 在通道全忙时**不抢占**（直接放弃播放），快速连按会导致旧音继续、新音丢失、叠加混乱
+- **解法**：`set_num_channels(1)` 限制并发 + 每次播放前 `pygame.mixer.stop()` 显式打断——新按键音必定替换旧音
+- 应用点：`SoundEngine.play`（按键音效）、`NoteEngine.play_midi`（音符/旋律）统一走 `_play_interrupt`
+
 ---
 
 ## 6. 使用指南
@@ -341,10 +359,22 @@ SOUNDS = {
 
 ---
 
-## 9. 后续规划
+## 9. 打包 exe（已完成）
+
+```bash
+.venv/Scripts/python.exe -m PyInstaller --noconsole --onefile --name KeyTone --add-data "sounds;sounds" main.py
+# 或复用已有配置：.venv/Scripts/python.exe -m PyInstaller KeyTone.spec
+```
+
+**打包适配要点**：
+- `resource_path()`：PyInstaller onefile 运行时资源在 `_MEIPASS` 临时目录，用它解析 wav 路径（源码运行回退到项目目录）
+- `APP_DIR`：日志写到 exe 所在目录（`sys.executable` 目录），避免写进临时解压区
+- `--noconsole`：无控制台窗口；`--onefile`：单文件分发
+- 产物 `dist/KeyTone.exe` 约 17.7MB，双击即用，无需 Python 环境
+
+## 10. 后续规划
 
 1. **tkinter 图形界面**：可视化编辑按键-音效映射，调节滑块直接调用 `SoundEngine` 接口
 2. **json 配置持久化**：`KEY_SOUND_MAP`、音量、音调存入配置文件，重启不丢失
-3. **打包 exe**：PyInstaller 打包，`--noconsole` 实现真正的无窗口幽灵程序，可分发给无 Python 环境的机器
 
 > 架构已为以上扩展预留接口：调节走 `SoundEngine.set_volume/set_pitch`，映射走配置文件即可，主循环无需改动。
