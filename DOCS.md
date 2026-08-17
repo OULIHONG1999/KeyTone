@@ -69,6 +69,8 @@ pythonw main.py
 | `main.py` | 主程序（三种模式/打断播放/单实例/toast/日志） | 否 |
 | `start_ghost.vbs` | 双击无窗口启动脚本（源码版） | 否 |
 | `generate_sounds.py` | 测试音效生成器（纯标准库） | 可选 |
+| `generate_presets.py` | 预制音库生成器（36 个电子琴音 → presets/） | 可选 |
+| `presets/` | 预制音效库（C3~B5 共 36 个 wav，配置 sound_map 引用） | 可选 |
 | `download_douyin.py` | 抖音视频下载工具（Cookie 从 `douyin_cookies.txt` 读取） | 可选 |
 | `douyin_cookies.txt` | 抖音登录 Cookie（敏感，**不入库**） | 用完可删 |
 | `KeyTone.spec` | PyInstaller 打包配置 | 否 |
@@ -130,14 +132,23 @@ class SoundEngine:
 
 | 设计点 | 说明 |
 |---|---|
-| 乐谱 | `MELODY` 简谱字符串（1-7 为 do-si，`'` 高八度、`.` 低八度、`0` 休止，空格仅分组），默认《小星星》 |
-| 播放规则 | 不管按哪个键，都播放 `_notes[_pos]` 并推进游标；到尾 `(pos+1) % len` 循环 |
-| 简谱转音高 | `_solfa_to_midi`：简谱 → MIDI（C 大调 do=C4），休止符返回 None（无声推进） |
+| 曲目表 | `melodies` 配置（曲名 → 简谱），内置 6 首；`melody_index` 记录选中曲目 |
+| 切换 | `switch_next()` 循环切曲目（F11），toast 显示曲名并写回配置 |
+| 播放规则 | 不管按哪个键，都播放当前曲目 `_notes[_pos]` 并推进游标；到尾 `(pos+1) % len` 循环 |
+| 简谱转音高 | `_solfa_to_midi`：简谱 → MIDI（C 大调 do=C4），`'` 高八度、`.` 低八度、休止符返回 None |
 | 音色/缓存 | 复用 `NoteEngine.play_midi`（共享合成缓存），音量跟随全局 |
 
-### 4.2.3 模式切换
+### 4.2.3 模式切换与 F11
 
 `MODE` 全局变量（0=按键音效 / 1=音符弹琴 / 2=预制旋律），F12 触发 `toggle_mode()`：`(MODE+1) % 3` 循环切换并弹 toast 提示，不发声。
+
+**F11 多用途切换**（`on_press` 分发）：
+
+| 当前模式 | F11 行为 |
+|---|---|
+| 按键音效 | 切换音效方案：用户配置 ↔ 内置默认（`SoundEngine.reload_map` 热重载） |
+| 音符弹琴 | 切换音色：电子琴 / 正弦 / 方波（`NoteEngine.set_wave`，缓存按音色隔离） |
+| 预制旋律 | 切换曲目：下一首（`switch_melody`，写回 `melody_index`） |
 
 **预加载设计**：初始化时一次性把所有 wav 读入内存（`Sound` + 原始采样），运行时按键不再读文件，播放零延迟。
 
@@ -320,9 +331,10 @@ KEY_SOUND_MAP = {
 
 | 字段 | 说明 |
 |---|---|
-| `sound_map` | 按键 → 音效路径；相对路径经 `resource_path` 解析（打包资源），绝对路径直接使用（自定义外部音效） |
+| `sound_map` | 按键 → 音效路径；相对路径先查程序目录（`presets/` 等外部音效）再查打包资源，绝对路径直接使用 |
 | `default_sound` | 未映射按键默认音效 |
-| `melody` | 预制旋律乐谱 |
+| `melodies` | 预制旋律曲目表（曲名 → 简谱），内置 6 首，可增删 |
+| `melody_index` | 当前选中曲目索引（F11 切换写回） |
 | `volume` / `pitch` | 音量/音调；启动时应用到引擎，运行时调节经 `handle_control` 自动写回 |
 
 实现：`load_config()`（深拷贝默认值 + 合并用户字段）/ `save_config()`（indent=2 可读格式）；`CONFIG` 为模块级字典，引擎与旋律引擎均从其取值。

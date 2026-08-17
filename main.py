@@ -62,10 +62,21 @@ DEFAULT_SOUND = "sounds/default.wav"
 
 # 配置文件（exe/源码同目录）+ 默认配置
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+# 内置预制音乐（曲名 → 简谱；' 高八度、. 低八度、0 休止、空格分组）
+MELODIES_DEFAULT = {
+    "小星星": "1155665 4433221 5544332 5544332 1155665 4433221",
+    "两只老虎": "1231 1231 345 345 565431 565431 151 151",
+    "生日快乐": "55651'7 55652'1' 555'3'1'76 443'1'2'1'",
+    "欢乐颂": "33455432 1123322 33455432 1123211",
+    "粉刷匠": "5353531 24325 5353531 24321",
+    "铃儿响叮当": "333 333 351'2'3' 4'4'3'3'3' 2'2'3'2'5 333 333 351'2'3' 4'4'3'3'3' 2'2'3'2'1",
+}
+
 DEFAULT_CONFIG = {
     "sound_map": dict(KEY_SOUND_MAP),
     "default_sound": DEFAULT_SOUND,
-    "melody": "1155665 4433221 5544332 5544332 1155665 4433221",
+    "melodies": MELODIES_DEFAULT,
+    "melody_index": 0,
     "volume": 0.5,
     "pitch": 1.0,
 }
@@ -130,8 +141,18 @@ class SoundEngine:
     def pitch(self):
         return self._pitch
 
+    @staticmethod
+    def _resolve_sound_path(path):
+        """解析音效路径：绝对路径直接用；相对路径先查程序目录（外部音效），再查打包资源。"""
+        if os.path.isabs(path):
+            return path
+        external = os.path.join(APP_DIR, path)
+        if os.path.exists(external):
+            return external
+        return resource_path(path)
+
     def _load(self, name, path):
-        full = path if os.path.isabs(path) else resource_path(path)
+        full = self._resolve_sound_path(path)
         try:
             sound = pygame.mixer.Sound(full)
         except Exception as e:
@@ -180,6 +201,16 @@ class SoundEngine:
 
     def set_pitch(self, mult):
         self._pitch = max(PITCH_MIN, min(PITCH_MAX, mult))
+
+    def reload_map(self, sound_map):
+        """热重载按键音效映射（F11 切换方案），默认音始终保留。"""
+        for name in [n for n in self._sounds if n != self._default]:
+            if name not in sound_map:
+                del self._sounds[name]
+                del self._raw[name]
+        for name, path in sound_map.items():
+            if name not in self._sounds:
+                self._load(name, path)
 
     def play(self, name):
         """播放按键音；未映射的按键回退到默认音（两者都缺失则静默放弃）。"""
@@ -236,9 +267,13 @@ class NoteEngine:
 
     def __init__(self):
         self._cache = {}
+        self._wave = 0  # 0=电子琴 1=正弦 2=方波
+
+    def set_wave(self, wave):
+        self._wave = wave
 
     def _synth(self, midi):
-        """合成电子琴音：正弦 + 2/3 次泛音 + 指数衰减，0.4s。"""
+        """按当前音色合成音符（0.4s，指数衰减）。"""
         freq = 440.0 * (2.0 ** ((midi - 69) / 12.0))
         n = int(SAMPLE_RATE * 0.4)
         # 按 mixer 实际声道数生成交错数据（SDL 可能把 mono 请求改写为 stereo）
@@ -247,9 +282,14 @@ class NoteEngine:
         for i in range(n):
             t = i / SAMPLE_RATE
             env = math.exp(-8.0 * t)
-            v = (math.sin(2.0 * math.pi * freq * t)
-                 + 0.5 * math.sin(4.0 * math.pi * freq * t)
-                 + 0.25 * math.sin(6.0 * math.pi * freq * t)) / 1.75
+            if self._wave == 1:  # 纯正弦（柔和）
+                v = math.sin(2.0 * math.pi * freq * t)
+            elif self._wave == 2:  # 方波（复古）
+                v = 1.0 if math.sin(2.0 * math.pi * freq * t) >= 0 else -1.0
+            else:  # 电子琴（默认）
+                v = (math.sin(2.0 * math.pi * freq * t)
+                     + 0.5 * math.sin(4.0 * math.pi * freq * t)
+                     + 0.25 * math.sin(6.0 * math.pi * freq * t)) / 1.75
             s = int(32767 * env * v)
             frames.append(s)
             if channels == 2:
@@ -257,13 +297,14 @@ class NoteEngine:
         return pygame.mixer.Sound(buffer=array.array("h", frames).tobytes())
 
     def play_midi(self, midi):
-        """按 MIDI 编号播放音符（共享缓存）；midi 为 None 时静默。"""
+        """按 MIDI 编号播放音符（共享缓存，按音色隔离）；midi 为 None 时静默。"""
         if midi is None:
             return
-        snd = self._cache.get(midi)
+        key = (self._wave, midi)
+        snd = self._cache.get(key)
         if snd is None:
             snd = self._synth(midi)
-            self._cache[midi] = snd
+            self._cache[key] = snd
         snd.set_volume(engine.volume * 0.7)  # 跟随全局音量
         _play_interrupt(snd)
 
@@ -283,11 +324,28 @@ def _solfa_to_midi(note):
 
 
 class MelodyEngine:
-    """预制旋律引擎：不管按哪个键，都按乐谱顺序播放下一个音，到尾循环。"""
+    """预制旋律引擎：多首曲目，F11 切换；不管按哪个键都按当前曲目顺序播放下一个音。"""
 
-    def __init__(self, melody):
-        self._notes = [c for c in melody if c != " "]
+    def __init__(self, melodies):
+        self._melodies = dict(melodies)
+        self._names = list(melodies)
+        self._name = self._names[0] if self._names else ""
+        self._notes = [c for c in self._melodies.get(self._name, "") if c != " "]
         self._pos = 0
+
+    @property
+    def name(self):
+        return self._name
+
+    def switch_next(self):
+        """切到下一首曲目（循环），返回新曲名。"""
+        if not self._names:
+            return ""
+        idx = (self._names.index(self._name) + 1) % len(self._names)
+        self._name = self._names[idx]
+        self._notes = [c for c in self._melodies[self._name] if c != " "]
+        self._pos = 0
+        return self._name
 
     def play(self):
         """播放当前位置的音符并推进游标（休止符无声推进）。"""
@@ -300,8 +358,47 @@ class MelodyEngine:
 
 # 音符引擎实例 + 当前模式
 note_engine = NoteEngine()
-melody_engine = MelodyEngine(CONFIG["melody"])
+melody_engine = MelodyEngine(CONFIG["melodies"])
+# 应用配置选中的曲目
+for _ in range(CONFIG.get("melody_index", 0) % max(len(melody_engine._names), 1)):
+    melody_engine.switch_next()
 MODE = MODE_SOUND
+
+
+def switch_melody():
+    """切到下一首曲目（F11），toast 提示并写回配置。"""
+    name = melody_engine.switch_next()
+    if name:
+        CONFIG["melody_index"] = melody_engine._names.index(name)
+        save_config(CONFIG)
+    _toast("KeyTone 键响匣", f"曲目：{name}" if name else "暂无曲目")
+
+
+# F11 多用途：按键音效切方案 / 音符弹琴切音色 / 旋律切曲目
+SOUND_PROFILES = {
+    "用户配置": CONFIG["sound_map"],
+    "内置默认": dict(KEY_SOUND_MAP),
+}
+PROFILE_NAMES = list(SOUND_PROFILES)
+_profile_index = 0  # 初始为用户配置（engine 默认即用户映射）
+WAVE_NAMES = ("电子琴", "正弦", "方波")
+_wave_index = 0
+
+
+def switch_sound_profile():
+    """F11：切换按键音效方案（用户配置 ↔ 内置默认）。"""
+    global _profile_index
+    _profile_index = (_profile_index + 1) % len(PROFILE_NAMES)
+    engine.reload_map(SOUND_PROFILES[PROFILE_NAMES[_profile_index]])
+    _toast("KeyTone 键响匣", f"音效方案：{PROFILE_NAMES[_profile_index]}")
+
+
+def switch_note_wave():
+    """F11：切换音符弹琴音色（电子琴/正弦/方波）。"""
+    global _wave_index
+    _wave_index = (_wave_index + 1) % len(WAVE_NAMES)
+    note_engine.set_wave(_wave_index)
+    _toast("KeyTone 键响匣", f"音色：{WAVE_NAMES[_wave_index]}")
 
 
 def toggle_mode():
@@ -397,9 +494,17 @@ def on_press(key):
         return
     pressed_set.add(char)
 
-    # F12 切换 按键音效 ↔ 音符弹琴 模式（本身不发声）
+    # F12 切换模式 / F11 多用途切换（本身不发声）
     if char == MODE_TOGGLE_KEY:
         toggle_mode()
+        return
+    if char == "f11":
+        if MODE == MODE_MELODY:
+            switch_melody()
+        elif MODE == MODE_NOTE:
+            switch_note_wave()
+        else:
+            switch_sound_profile()
         return
 
     action = CONTROL_KEYS.get(char)
