@@ -314,6 +314,19 @@ KEY_SOUND_MAP = {
 | 音色 | 与音符模式共享合成电子琴音与缓存 |
 | 控制键 | `=`/`-` 音量、`]`/`[` 音调调节同样生效 |
 
+### 6.6 配置文件（config.json）
+
+启动时自动生成于程序同目录（`APP_DIR/config.json`），缺失/损坏时回退默认值并重建：
+
+| 字段 | 说明 |
+|---|---|
+| `sound_map` | 按键 → 音效路径；相对路径经 `resource_path` 解析（打包资源），绝对路径直接使用（自定义外部音效） |
+| `default_sound` | 未映射按键默认音效 |
+| `melody` | 预制旋律乐谱 |
+| `volume` / `pitch` | 音量/音调；启动时应用到引擎，运行时调节经 `handle_control` 自动写回 |
+
+实现：`load_config()`（深拷贝默认值 + 合并用户字段）/ `save_config()`（indent=2 可读格式）；`CONFIG` 为模块级字典，引擎与旋律引擎均从其取值。
+
 ### 6.3 音效生成器参数（generate_sounds.py）
 
 ```python

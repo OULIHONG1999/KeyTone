@@ -10,6 +10,7 @@
 # ============================================================
 import array
 import ctypes
+import json
 import logging
 import math
 import os
@@ -59,6 +60,41 @@ KEY_SOUND_MAP = {
 # 未映射按键的默认音效，保证每个键按下都有声音
 DEFAULT_SOUND = "sounds/default.wav"
 
+# 配置文件（exe/源码同目录）+ 默认配置
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+DEFAULT_CONFIG = {
+    "sound_map": dict(KEY_SOUND_MAP),
+    "default_sound": DEFAULT_SOUND,
+    "melody": "1155665 4433221 5544332 5544332 1155665 4433221",
+    "volume": 0.5,
+    "pitch": 1.0,
+}
+
+
+def load_config():
+    """读取 config.json；缺失/损坏时回退默认值并写回一份。"""
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # 深拷贝
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            user = json.load(f)
+        for key in cfg:
+            if key in user:
+                cfg[key] = user[key]
+    except FileNotFoundError:
+        save_config(cfg)
+    except Exception as e:
+        log.warning("配置读取失败，使用默认值: %s", e)
+    return cfg
+
+
+def save_config(cfg):
+    """写入 config.json（保留用户可读格式）。"""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("配置写入失败: %s", e)
+
 # 音调调节范围 / 步进
 PITCH_MIN, PITCH_MAX = 0.5, 2.0
 ADJUST_STEP = 0.05
@@ -95,8 +131,9 @@ class SoundEngine:
         return self._pitch
 
     def _load(self, name, path):
+        full = path if os.path.isabs(path) else resource_path(path)
         try:
-            sound = pygame.mixer.Sound(resource_path(path))
+            sound = pygame.mixer.Sound(full)
         except Exception as e:
             log.warning("音效加载失败 %s: %s", path, e)
             return
@@ -155,8 +192,11 @@ class SoundEngine:
         _play_interrupt(snd)
 
 
-# 全局音效引擎（模块级实例，供回调使用）
-engine = SoundEngine(KEY_SOUND_MAP, DEFAULT_SOUND)
+# 全局配置 + 音效引擎（模块级实例，供回调使用）
+CONFIG = load_config()
+engine = SoundEngine(CONFIG["sound_map"], CONFIG["default_sound"])
+engine.set_volume(CONFIG["volume"])
+engine.set_pitch(CONFIG["pitch"])
 
 # ========== 音符弹琴模式：任意按键按下都发一个电子琴音 ==========
 # 模式：0=按键音效，1=音符弹琴，2=预制旋律；F12 循环切换（本身不发声）
@@ -232,14 +272,6 @@ class NoteEngine:
         self.play_midi(_midi_of(char))
 
 
-# 预制旋律（简谱：1-7 为 do-si，' 高八度、. 低八度，0 休止；空格仅作分组）
-MELODY = (
-    "1155665 4433221 "
-    "5544332 5544332 "
-    "1155665 4433221"
-)
-
-
 def _solfa_to_midi(note):
     """简谱音名 → MIDI 编号；休止符/无法识别返回 None。"""
     base = {"1": 60, "2": 62, "3": 64, "4": 65, "5": 67, "5'": 79, "6": 69, "7": 71}
@@ -268,7 +300,7 @@ class MelodyEngine:
 
 # 音符引擎实例 + 当前模式
 note_engine = NoteEngine()
-melody_engine = MelodyEngine(MELODY)
+melody_engine = MelodyEngine(CONFIG["melody"])
 MODE = MODE_SOUND
 
 
@@ -306,6 +338,10 @@ def handle_control(action):
         engine.set_pitch(engine.pitch + ADJUST_STEP)
     elif action == "pitch_down":
         engine.set_pitch(engine.pitch - ADJUST_STEP)
+    # 调节后写回配置，重启保留
+    CONFIG["volume"] = engine.volume
+    CONFIG["pitch"] = engine.pitch
+    save_config(CONFIG)
 
 
 def _toast(title, message, wait=False, duration_ms=1600):

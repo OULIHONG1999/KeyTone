@@ -21,6 +21,9 @@ douyin_cookies.txt
 *.log
 keytone.log
 
+# ===== 用户配置（个人按键映射，不入库） =====
+config.json
+
 # ===== 系统文件 =====
 Thumbs.db
 Desktop.ini
