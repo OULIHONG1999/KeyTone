@@ -17,6 +17,7 @@ import os
 import sys
 import threading
 import tkinter as tk
+import winreg
 
 import pygame
 from pynput import keyboard
@@ -233,6 +234,12 @@ engine.set_pitch(CONFIG["pitch"])
 # 模式：0=按键音效，1=音符弹琴，2=预制旋律；F12 循环切换（本身不发声）
 MODE_SOUND, MODE_NOTE, MODE_MELODY = 0, 1, 2
 MODE_NAMES = ("按键音效模式", "音符弹琴模式", "预制旋律模式")
+# 各模式的按键功能提示（toast 显示）
+MODE_HINTS = {
+    MODE_SOUND: ("模式 按键音效", "F11 切音效方案"),
+    MODE_NOTE: ("模式 音符弹琴", "F11 切音色"),
+    MODE_MELODY: ("模式 预制旋律", "F11 切曲目"),
+}
 MODE_TOGGLE_KEY = "f12"
 
 # 键盘布局 → 音高：主键盘区按行（行越高音越高，行内左低右高），
@@ -371,7 +378,7 @@ def switch_melody():
     if name:
         CONFIG["melody_index"] = melody_engine._names.index(name)
         save_config(CONFIG)
-    _toast("KeyTone 键响匣", f"曲目：{name}" if name else "暂无曲目")
+    _toast("KeyTone 键响匣", f"曲目 {name}" if name else "曲目 暂无", "F11 下一首")
 
 
 # F11 多用途：按键音效切方案 / 音符弹琴切音色 / 旋律切曲目
@@ -390,7 +397,7 @@ def switch_sound_profile():
     global _profile_index
     _profile_index = (_profile_index + 1) % len(PROFILE_NAMES)
     engine.reload_map(SOUND_PROFILES[PROFILE_NAMES[_profile_index]])
-    _toast("KeyTone 键响匣", f"音效方案：{PROFILE_NAMES[_profile_index]}")
+    _toast("KeyTone 键响匣", f"音效 {PROFILE_NAMES[_profile_index]}", "F11 切换方案")
 
 
 def switch_note_wave():
@@ -398,14 +405,15 @@ def switch_note_wave():
     global _wave_index
     _wave_index = (_wave_index + 1) % len(WAVE_NAMES)
     note_engine.set_wave(_wave_index)
-    _toast("KeyTone 键响匣", f"音色：{WAVE_NAMES[_wave_index]}")
+    _toast("KeyTone 键响匣", f"音色 {WAVE_NAMES[_wave_index]}", "F11 切换音色")
 
 
 def toggle_mode():
-    """循环切换三种模式（F12），toast 提示。"""
+    """循环切换三种模式（F12），toast 显示模式与按键功能。"""
     global MODE
     MODE = (MODE + 1) % 3
-    _toast("KeyTone 键响匣", MODE_NAMES[MODE])
+    msg, hint = MODE_HINTS[MODE]
+    _toast("KeyTone 键响匣", msg, hint)
     log.info("模式切换: %s", MODE_NAMES[MODE])
 
 def _play_interrupt(snd):
@@ -415,11 +423,10 @@ def _play_interrupt(snd):
 
 
 # 控制键：= / - 调音量，] / [ 调音调（静默调节，按键本身不发声）
+# 调节键：F9 音量- / F10 音量+（功能键，不影响打字输入）
 CONTROL_KEYS = {
-    "=": "vol_up",
-    "-": "vol_down",
-    "]": "pitch_up",
-    "[": "pitch_down",
+    "f9": "vol_down",
+    "f10": "vol_up",
 }
 
 # 记录已经按下的按键，防止长按重复播放
@@ -439,39 +446,246 @@ def handle_control(action):
     CONFIG["volume"] = engine.volume
     CONFIG["pitch"] = engine.pitch
     save_config(CONFIG)
+    _toast("KeyTone 键响匣", f"调节 音量 {engine.volume:.2f}  音调 {engine.pitch:.2f}", "F9 音量-  F10 音量+")
 
 
-def _toast(title, message, wait=False, duration_ms=1600):
-    """自定义轻量 toast：tkinter 无边框置顶小窗，右下角显示，自动消失。
+# ========== toast：单 Tk 主线程架构 ==========
+# 多线程各自创建 Tk 会导致 Tcl 解释器冲突崩溃（Tcl 非线程安全），
+# 改为：模块级隐藏根窗口 + 所有 toast 由主线程 mainloop/update 驱动
+_tk_root = tk.Tk()
+_tk_root.withdraw()
 
-    进程内创建（无需 PowerShell 子进程，几十毫秒），响应快；
-    wait=True 时等待显示完毕再返回（用于重复启动后退出前）。
+# 堆叠式 toast：活跃窗口列表（从下到上）+ 尺寸常量
+_toast_windows = []
+TOAST_W, TOAST_H, TOAST_GAP = 300, 104, 12
+TOAST_BOTTOM = 80
+
+
+def _system_dark_theme():
+    """读取 Windows 系统深浅色主题；失败默认深色。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+            val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            return val == 0  # 0 = 深色
+    except OSError:
+        return True
+
+
+def _system_accent_color():
+    """读取 Windows 系统强调色（AccentColor，ABGR 格式）；失败回退默认蓝。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\DWM") as key:
+            val, _ = winreg.QueryValueEx(key, "AccentColor")
+        b, g, r = val & 0xFF, (val >> 8) & 0xFF, (val >> 16) & 0xFF
+        return f"#{r:02x}{g:02x}{b:02x}"
+    except OSError:
+        return "#3b9eff"
+
+
+def _slide_to(w, tx, ty, steps=6, delay=20):
+    """平滑移动窗口到目标位置（主线程 after 链）。"""
+    x0, y0 = w.winfo_x(), w.winfo_y()
+    if (x0, y0) == (tx, ty):
+        return
+    dx, dy = (tx - x0) / steps, (ty - y0) / steps
+    def step(i=0):
+        if i >= steps:
+            w.geometry(f"{TOAST_W}x{TOAST_H}+{tx}+{ty}")
+            return
+        w.geometry(f"{TOAST_W}x{TOAST_H}+{int(x0 + dx * i)}+{int(y0 + dy * i)}")
+        w.after(delay, lambda: step(i + 1))
+    step()
+
+
+def _reflow_toasts():
+    """销毁后重排：剩余 toast 从底部向上依次回位。"""
+    sh = _tk_root.winfo_screenheight()
+    y = sh - TOAST_H - TOAST_BOTTOM
+    for w in reversed(_toast_windows):
+        _slide_to(w, w.winfo_x(), y)
+        y -= TOAST_H + TOAST_GAP
+
+
+def _close_toast(win, quit_on_close):
+    """销毁 toast、移出列表、重排剩余窗口（wait 场景同时 quit）。"""
+    if win in _toast_windows:
+        _toast_windows.remove(win)
+    win.destroy()
+    if quit_on_close:
+        win.quit()
+    _reflow_toasts()
+
+
+# Windows 磨砂玻璃（Acrylic）支持：SetWindowCompositionAttribute
+if sys.platform == "win32":
+    class _ACCENT_POLICY(ctypes.Structure):
+        _fields_ = [("AccentState", ctypes.c_int), ("AccentFlags", ctypes.c_int),
+                    ("GradientColor", ctypes.c_uint), ("AnimationId", ctypes.c_int)]
+
+    class _WCA_DATA(ctypes.Structure):
+        _fields_ = [("Attrib", ctypes.c_int), ("Data", ctypes.c_void_p),
+                    ("SizeOfData", ctypes.c_size_t)]
+
+
+def _apply_acrylic(hwnd, gradient_color=0xAA1F1F1F):
+    """启用 Windows Acrylic 磨砂背景；成功返回 True，失败返回 False。"""
+    try:
+        if sys.platform != "win32":
+            return False
+        accent = _ACCENT_POLICY(4, 2, gradient_color, 0)  # AccentState=4 磨砂
+        data = _WCA_DATA(19, ctypes.addressof(accent), ctypes.sizeof(accent))
+        ctypes.windll.user32.SetWindowCompositionAttribute(hwnd, ctypes.byref(data))
+        return True
+    except Exception:
+        return False
+
+
+def _apply_round_rect(hwnd, w, h, radius=18):
+    """圆角窗口区域：CreateRoundRectRgn + SetWindowRgn。"""
+    try:
+        if sys.platform != "win32":
+            return
+        rgn = ctypes.windll.gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius)
+        ctypes.windll.user32.SetWindowRgn(hwnd, rgn, True)
+    except Exception:
+        pass
+
+
+def _round_rect(canvas, x1, y1, x2, y2, r, **kw):
+    """Canvas 圆角矩形（smooth 多边形），fill/outline 沿圆角弧线。"""
+    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+           x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+    return canvas.create_polygon(pts, smooth=True, **kw)
+
+
+def _build_toast_window(title, message, hint, duration_ms, quit_on_close=False):
+    """创建堆叠式 toast：新 toast 淡入出现在底部，旧 toast 被往上推，倒计时淡出销毁。
+
+    自动适配系统深浅色主题；圆角 + 磨砂（Acrylic）+ 半透明背景。
     """
-    def worker():
+    # 主题色板 + 系统强调色
+    accent = _system_accent_color()
+    if _system_dark_theme():
+        BG, BORDER, SEP = "#202020", "#3a3a3a", "#333333"
+        FG_TITLE, FG_MSG, FG_HINT = "#ffffff", "#eeeeee", "#9a9a9a"
+        ACCENT = 0xAA202020
+    else:
+        BG, BORDER, SEP = "#f5f5f5", "#d5d5d5", "#e2e2e2"
+        FG_TITLE, FG_MSG, FG_HINT = "#1a1a1a", "#333333", "#888888"
+        ACCENT = 0xAAE8E8E8
+    hint = hint or "F12/F11 切换  F9/F10 音量"
+    win = tk.Toplevel(_tk_root)
+    win.overrideredirect(True)
+    win.attributes("-topmost", True)
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    x = (sw - TOAST_W) // 2
+    win.geometry(f"{TOAST_W}x{TOAST_H}+{x}+{sh}")  # 初始屏幕底部外
+    # 极简圆角卡片：无描边（磨砂+半透明分层），文本全部 create_text（无背景、不遮挡）
+    canvas = tk.Canvas(win, width=TOAST_W, height=TOAST_H, bg=BG, highlightthickness=0)
+    canvas.pack()
+    _round_rect(canvas, 0, 0, TOAST_W, TOAST_H, 14, fill=BG)
+    # 强调色圆形图标（标题首字符）
+    canvas.create_oval(14, 14, 42, 42, fill=accent, outline="")
+    canvas.create_text(28, 28, text=title[:1], fill="#ffffff",
+                       font=("Microsoft YaHei", 12, "bold"))
+    # 标题（图标右侧，与图标垂直居中对齐）
+    canvas.create_text(50, 28, text=title, anchor="w", fill=FG_TITLE,
+                       font=("Microsoft YaHei", 10, "bold"))
+    # 倒计时（右上角，与标题同水平线）
+    remaining = [max(1, round(duration_ms / 1000))]
+    count_lbl = canvas.create_text(TOAST_W - 14, 28, text=f"{remaining[0]}s",
+                                   anchor="e", fill=FG_HINT,
+                                   font=("Microsoft YaHei", 9))
+    # 分隔线：标题与内容之间
+    canvas.create_line(14, 48, TOAST_W - 14, 48, fill=SEP, width=1)
+    # 内容行（create_text 自动换行，无背景不遮挡）
+    canvas.create_text(50, 56, text=message, anchor="nw", fill=FG_MSG,
+                       font=("Microsoft YaHei", 10), width=240, justify="left")
+    # 提示行
+    canvas.create_text(50, 84, text=f"提示 {hint}", anchor="nw", fill=FG_HINT,
+                       font=("Microsoft YaHei", 8), width=240, justify="left")
+
+    # 旧 toast 上移一格（往上推）
+    for w in list(_toast_windows):
+        _slide_to(w, w.winfo_x(), w.winfo_y() - (TOAST_H + TOAST_GAP))
+    _toast_windows.append(win)
+
+    # 视觉：圆角 + 磨砂 + 半透明背景（半透明保证生效）
+    win.update_idletasks()
+    hwnd = win.winfo_id()  # Toplevel 句柄即顶层窗口（勿用 GetParent）
+    _apply_round_rect(hwnd, TOAST_W, TOAST_H, 14)  # 圆角半径与 Canvas 卡片一致
+    _apply_acrylic(hwnd, ACCENT)
+    win.attributes("-alpha", 0.9)
+
+    # 淡入（渐渐显示）
+    def fade_in(alpha=0.0):
+        if alpha >= 0.85:
+            win.attributes("-alpha", 0.9)
+            return
+        win.attributes("-alpha", max(alpha, 0.1))
+        win.after(25, lambda: fade_in(alpha + 0.15))
+    fade_in()
+
+    # 从底部滑入到位
+    target_y = sh - TOAST_H - TOAST_BOTTOM
+    def slide_in(y):
+        if y <= target_y:
+            win.geometry(f"{TOAST_W}x{TOAST_H}+{x}+{target_y}")
+            return
+        win.geometry(f"{TOAST_W}x{TOAST_H}+{x}+{y}")
+        win.after(12, lambda: slide_in(max(target_y, y - 12)))
+    slide_in(sh)
+
+    # 倒计时归零 → 淡出 → 销毁重排
+    def fade_out():
+        alpha = float(win.attributes("-alpha"))
+        if alpha <= 0.05:
+            _close_toast(win, quit_on_close)
+            return
+        win.attributes("-alpha", alpha - 0.08)
+        win.after(30, fade_out)
+
+    def tick():
+        remaining[0] -= 1
+        if remaining[0] <= 0:
+            fade_out()
+            return
+        canvas.itemconfig(count_lbl, text=f"{remaining[0]}s")
+        win.after(1000, tick)
+
+    win.bind("<Button-1>", lambda _e: _close_toast(win, quit_on_close))
+    win.after(1000, tick)
+    return win
+
+
+def _show_toast_ui(title, message, hint, duration_ms):
+    """主线程内弹出 toast（由 mainloop 驱动）。"""
+    try:
+        _build_toast_window(title, message, hint, duration_ms)
+    except Exception as e:
+        log.warning("toast 提示失败: %s", e)
+
+
+def _toast(title, message, hint="", wait=False, duration_ms=3000):
+    """统一 toast：① 标题行（含倒计时）② 内容行（标签 · 内容）③ 提示行。
+
+    异步（默认）调度到主线程 mainloop；wait=True（重复启动退出前）由窗口自身
+    mainloop 同步驱动。不使用任何手动事件泵。
+    """
+    if wait:
         try:
-            root = tk.Tk()
-            root.overrideredirect(True)
-            root.attributes("-topmost", True)
-            root.attributes("-alpha", 0.92)
-            w, h = 280, 64
-            sw = root.winfo_screenwidth()
-            sh = root.winfo_screenheight()
-            root.geometry(f"{w}x{h}+{sw - w - 24}+{sh - h - 24}")
-            frame = tk.Frame(root, bg="#1f1f1f")
-            frame.pack(fill="both", expand=True)
-            tk.Label(frame, text=title, bg="#1f1f1f", fg="#ffffff",
-                     font=("Microsoft YaHei", 10, "bold")).pack(pady=(10, 0))
-            tk.Label(frame, text=message, bg="#1f1f1f", fg="#cccccc",
-                     font=("Microsoft YaHei", 9)).pack(pady=(2, 10))
-            root.bind("<Button-1>", lambda _e: root.destroy())
-            root.after(duration_ms, root.destroy)
-            root.mainloop()
+            win = _build_toast_window(title, message, hint, duration_ms, quit_on_close=True)
+            win.mainloop()  # 窗口事件循环：驱动倒计时，关闭（quit）后返回
         except Exception as e:
             log.warning("toast 提示失败: %s", e)
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-    if wait:
-        t.join(timeout=duration_ms / 1000 + 0.3)
+        return
+    try:
+        _tk_root.after(0, lambda: _show_toast_ui(title, message, hint, duration_ms))
+    except Exception as e:
+        log.warning("toast 调度失败: %s", e)
 
 
 def _single_instance_lock():
@@ -532,14 +746,14 @@ def on_release(key):
 
 if __name__ == "__main__":
     if not _single_instance_lock():
-        _toast("KeyTone 键响匣", "已在运行，请勿重复启动", wait=True)
+        _toast("KeyTone 键响匣", "状态 已在运行，请勿重复启动", "任务管理器结束进程", wait=True)
         log.warning("检测到已有实例，本次启动退出")
         sys.exit(0)
-    _toast("KeyTone 键响匣", "已启动，后台静默运行中")
+    _toast("KeyTone 键响匣", "状态 已启动，后台静默运行中", "F12/F11 切换  F9/F10 音量")
     log.info("KeyTone 幽灵版启动")
     try:
         listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         listener.start()
-        listener.join()
+        _tk_root.mainloop()  # 主线程事件循环：驱动 toast + 保持进程存活
     except Exception as e:
         log.error("监听器异常: %s", e)
